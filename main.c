@@ -330,10 +330,11 @@ int ishex(int c)
 int from_hexchars(String_View chars, int *v)
 {
     size_t i;
+    assert(chars.count == 2);
     for (i = 0; i < chars.count; ++i) {
         char c = tolower(chars.data[i]);
         if (!ishex(c)) return -1;
-        *v |= (c > '9' ? c - 'a' : c - '0');
+        *v |= (c > '9' ? c - 'a' + 10 : c - '0') << ((1-i)*4);
     }
     return 0;
 }
@@ -343,7 +344,7 @@ String_Builder http_decode_path(String_View path, int *err)
     String_Builder sb = {0};
 
     while (path.count) {
-        int b;
+        int b = 0;
         if (*path.data != '%') {
             da_append(&sb, *sv_chop(&path, 1).data);
             continue;
@@ -354,6 +355,7 @@ String_Builder http_decode_path(String_View path, int *err)
             from_hexchars(sv_chop(&path, 2), &b) < 0) {
             goto error;
         }
+        da_append(&sb, b);
     }
 
     return sb;
@@ -376,9 +378,9 @@ int parse_http_first_line(Connection *c, String_View line)
         switch (i) {
             case 0: c->method = word; break;
             case 1:
-                    assert(!c->requested_path.items);
-                    c->requested_path = http_decode_path(word, &err);
-                    break;
+                assert(!c->requested_path.items);
+                c->requested_path = http_decode_path(word, &err);
+                break;
         }
         if (err) return -1;
     }
