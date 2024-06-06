@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 
+#include <openssl/ssl.h>
+
 #define da_append(da, x) \
     do { \
         if ((da)->count >= (da)->capacity) { \
@@ -164,6 +166,10 @@ String_View sv_chop_by_cstr_delim(String_View *sv, const char *cstr)
 
 typedef struct {
     int fd;
+    void *handle;
+
+    int (*read)(void *, void *, int);
+    int (*write)(void *, const void *, int);
 
     char read_buf[512];
     char write_buf[512];
@@ -185,11 +191,20 @@ typedef struct {
 int bs_fetch(BufStream *bs)
 {
     int n;
-    n = read(bs->fd, &bs->read_buf[bs->read_avail + bs->read_pos],
+
+    n = bs->read(bs->handle, &bs->read_buf[bs->read_avail + bs->read_pos],
             sizeof(bs->read_buf) - bs->read_avail - bs->read_pos);
     if (n <= 0) {
-        bs->error = (errno == EAGAIN || errno == EWOULDBLOCK)
-            ? n == 0 : errno;
+        if (bs->handle != (void*) (long) bs->fd) {
+            int err = SSL_get_error(bs->handle, n);
+            printf("%d\n", err);
+            bs->error = !(err == SSL_ERROR_WANT_READ
+                         || err == SSL_ERROR_WANT_WRITE);
+            bs->error |= n == 0;
+        } else {
+            bs->error = !(errno == EAGAIN || errno == EWOULDBLOCK);
+            bs->error |= n == 0;
+        }
         return -1;
     }
     bs->read_avail += n;
@@ -219,7 +234,10 @@ int bs_read(BufStream *bs, void *to, int cnt)
 int read_until(BufStream *bs, String_Builder *sb, const char *until) {
     while (sv_ends_with_cstr(sv_from_sb(sb), until)) {
         char b;
-        if (bs_read(bs, &b, sizeof(b)) < 0) return -1;
+        int result;
+        result = bs_read(bs, &b, sizeof(b));
+        if (result < 0) return -2;
+        else if (result == 0) return -1;
         da_append(sb, b);
         if (sb->count > 512000) {
             return -2;
@@ -250,9 +268,13 @@ int http_connection_from_sv(String_View sv)
     return -1;
 }
 
+typedef struct ServerCtx ServerCtx;
+
 typedef struct {
+    ServerCtx *ctx;
     BufStream stream;
     bool dropped;
+    bool secure;
     time_t last_packet;
     enum {
         CST_REQUEST,
@@ -274,15 +296,17 @@ typedef struct {
     size_t capacity;
 } Connections;
 
-typedef struct {
-    int sock;
+struct ServerCtx {
+    int sock, secure_sock;
+    SSL *secure;
+    SSL_CTX *ssl_ctx;
     Connections connections;
     struct {
         struct pollfd *items;
         size_t count;
         size_t capacity;
     } polls;
-} ServerCtx;
+};
 
 /* TODO: maybe make it sorted array to do binary search */
 Connection *find_connection_by_pfd(Connections *cons, struct pollfd *pfd)
@@ -434,70 +458,97 @@ void handle_output(Connection *c)
     assert(0 && "Not implemented");
 }
 
-void delete_connection(ServerCtx *ctx, Connection *c)
+void delete_connection(Connection *c)
 {
     close(c->stream.fd);
-    da_delete(&ctx->connections, c);
-    da_delete(&ctx->polls, c->pfd);
+    da_delete(&c->ctx->connections, c);
+    da_delete(&c->ctx->polls, c->pfd);
     free(c->request.items);
     free(c->requested_path.items);
+    if (c->secure) {
+        SSL_free(c->stream.handle);
+    }
 }
 
-void handle_input(ServerCtx *ctx, Connection *c)
+void handle_input(Connection *c)
 {
     switch (c->state) {
     case CST_REQUEST: {
         if (client_request(c) < 0) {
-            delete_connection(ctx, c);
+            delete_connection(c);
         }
     } break;
     case CST_RESPONSING: {
         if (client_response(c) < 0) {
-            delete_connection(ctx, c);
+            delete_connection(c);
         }
     } break;
     default: assert(0 && "unreachable");
     }
 }
 
-Connection new_connection(int fd)
+void new_connection(ServerCtx *ctx, int fd, int secure)
 {
+    int opt = 1;
+    struct pollfd pfd;
     Connection c = {0};
+    c.ctx = ctx;
     c.stream.fd = fd;
+    if (secure) {
+        SSL *ssl = SSL_new(ctx->ssl_ctx);
+        SSL_set_fd(ssl, fd);
+        if (SSL_accept(ssl) <= 0) {
+            SSL_free(ssl);
+            return;
+        }
+
+        c.secure = true;
+        c.stream.handle = ssl;
+        c.stream.read = (int (*)(void *, void *, int)) SSL_read;
+        c.stream.write = (int (*)(void *, const void *, int)) SSL_write;
+    } else {
+        c.stream.handle = (void*) (long) fd;
+        c.stream.read = (int (*)(void *, void *, int)) (intptr_t) read;
+        c.stream.write = (int (*)(void *, const void *, int)) (intptr_t) write;
+    }
     c.last_packet = time(NULL);
-    return c;
+    ioctl(fd, FIONBIO, &opt);
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    da_append(&ctx->polls, pfd);
+    da_append(&ctx->connections, c);
 }
 
 void handle_server(ServerCtx *ctx)
 {
-    int newsock, n;
+    int n;
     size_t i;
     struct sockaddr_in inaddr;
     int inaddr_len = sizeof(inaddr);
     n = poll(ctx->polls.items, ctx->polls.count, -1);
     for (i = 0; i < ctx->polls.count && n; ++i) {
         struct pollfd *cpfd = &ctx->polls.items[i];
+        const bool secure = cpfd->fd == ctx->secure_sock;
         if (!cpfd->revents) continue;
         n--;
-        if (cpfd->fd == ctx->sock) {
-            int opt = 1;
-            struct pollfd pfd;
-            newsock = accept(ctx->sock, (struct sockaddr*)&inaddr, (socklen_t*)&inaddr_len);
-            ioctl(newsock, FIONBIO, &opt);
-            pfd.fd = newsock;
-            pfd.events = POLLIN;
-            pfd.revents = 0;
-            da_append(&ctx->polls, pfd);
-            da_append(&ctx->connections, new_connection(newsock));
+        if (cpfd->fd == ctx->sock || secure) {
+            int newsock;
+            newsock = accept(cpfd->fd, (struct sockaddr*)&inaddr, (socklen_t*)&inaddr_len);
+            new_connection(ctx, newsock, secure);
             continue;
         }
         if (cpfd->revents & POLLIN) {
             Connection *c = find_connection_by_pfd(&ctx->connections, cpfd);
-            handle_input(ctx, c);
+            handle_input(c);
         }
         if (cpfd->revents & POLLOUT) {
             Connection *c = find_connection_by_pfd(&ctx->connections, cpfd);
             handle_output(c);
+        }
+        if (cpfd->revents & ~(POLLOUT|POLLIN)) {
+            Connection *c = find_connection_by_pfd(&ctx->connections, cpfd);
+            delete_connection(c);
         }
     }
 }
@@ -508,13 +559,54 @@ const char *shift_args(int *argc, char ***argv)
     return (*argc)--, *(*argv)++;
 }
 
+int create_binded_sock(ServerCtx *ctx, int port)
+{
+    int sock;
+    struct sockaddr_in addr;
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        fprintf(stderr, "ERROR: could not create socket: %s\n",
+                strerror(errno));
+        exit(1);
+    }
+
+    {
+        int opt = 1;
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    }
+
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = 0;
+
+    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "ERROR: could not bind to port %d: %s\n",
+                port,
+                strerror(errno));
+        exit(1);
+    }
+
+    listen(sock, 15);
+    {
+        struct pollfd pfd;
+        pfd.fd = sock;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        da_append(&ctx->polls, pfd);
+    }
+    return sock;
+}
+
 int main(int argc, char **argv)
 {
-    int port = 8080;
+    int port = 8080, secure_port = 8081;
     const char *program_name = shift_args(&argc, &argv);
     const char *arg = shift_args(&argc, &argv);
-    struct sockaddr_in addr;
-    ServerCtx ctx;
+    ServerCtx ctx = {0};
+
+    ctx.ssl_ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX_use_certificate_file(ctx.ssl_ctx, "server.crt", SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(ctx.ssl_ctx, "server.key", SSL_FILETYPE_PEM);
 
     (void) program_name;
     for (; arg; arg = shift_args(&argc, &argv)) {
@@ -524,39 +616,18 @@ int main(int argc, char **argv)
                 return 1;
             }
             port = atoi(shift_args(&argc, &argv));
+        } else if (strcmp(arg, "-sport") == 0) {
+            if (argc == 0) {
+                fprintf(stderr, "ERROR: port number expected\n");
+                return 1;
+            }
+            secure_port = atoi(shift_args(&argc, &argv));
         }
     }
-    ctx.sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (ctx.sock < 0) {
-        fprintf(stderr, "ERROR: could not create socket: %s\n",
-                strerror(errno));
-        return 1;
-    }
 
-    {
-        int opt = 1;
-        setsockopt(ctx.sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    }
+    ctx.sock = create_binded_sock(&ctx, port);
+    ctx.secure_sock = create_binded_sock(&ctx, secure_port);
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = 0;
-
-    if (bind(ctx.sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "ERROR: could not bind to port %d: %s\n",
-                port,
-                strerror(errno));
-        return 1;
-    }
-
-    listen(ctx.sock, 15);
-    {
-        struct pollfd pfd;
-        pfd.fd = ctx.sock;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-        da_append(&ctx.polls, pfd);
-    }
     while (true) {
         handle_server(&ctx);
     }
