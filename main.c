@@ -432,7 +432,6 @@ typedef struct {
 
 struct ServerCtx {
     int sock, secure_sock;
-    SSL *secure;
     SSL_CTX *ssl_ctx;
     Connections connections;
     struct {
