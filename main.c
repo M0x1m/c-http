@@ -6,22 +6,38 @@
 #include <time.h>
 #include <errno.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <stddef.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <poll.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 
 #include <openssl/ssl.h>
 
-#define da_append(da, x) \
+#define da_alloc(da, cnt) \
     do { \
-        if ((da)->count >= (da)->capacity) { \
+        while ((da)->count + (cnt) > (da)->capacity) { \
             (da)->capacity = (da)->capacity ? (da)->capacity*2 : 1; \
             (da)->items = realloc((da)->items, sizeof(*(da)->items)*(da)->capacity); \
             assert((da)->items && "Buy more RAM"); \
         } \
+    } while (0)
+
+#define da_append_many(da, xs, cnt) \
+    do { \
+        assert(sizeof(*(xs)) == sizeof(*(da)->items)); \
+        da_alloc(da, cnt); \
+        memcpy(&(da)->items[(da)->count], xs, (cnt)*sizeof(*(da)->items)); \
+        (da)->count += (cnt); \
+    } while (0)
+
+#define da_append(da, x) \
+    do { \
+        da_alloc(da, 1); \
         (da)->items[(da)->count++] = x; \
     } while (0)
 
@@ -39,6 +55,12 @@ typedef struct {
     size_t count;
     size_t capacity;
 } String_Builder;
+
+void sb_append_cstr(String_Builder *sb, const char *cstr)
+{
+    size_t cstr_len = strlen(cstr);
+    da_append_many(sb, cstr, cstr_len);
+}
 
 typedef struct {
     const char *data;
@@ -181,7 +203,7 @@ typedef struct {
     int read_avail, read_pos;
     /*
        write_avail - available data to write to buffer (without flushing)
-       write_pos - position to which add data to buffer
+       write_pos - position from which send data to recipient
      */
     int write_avail, write_pos;
 
@@ -197,7 +219,6 @@ int bs_fetch(BufStream *bs)
     if (n <= 0) {
         if (bs->handle != (void*) (long) bs->fd) {
             int err = SSL_get_error(bs->handle, n);
-            printf("%d\n", err);
             bs->error = !(err == SSL_ERROR_WANT_READ
                          || err == SSL_ERROR_WANT_WRITE);
             bs->error |= n == 0;
@@ -246,6 +267,53 @@ int read_until(BufStream *bs, String_Builder *sb, const char *until) {
     return 0;
 }
 
+int bs_flush(BufStream *bs)
+{
+    int n = 0;
+    n = bs->write(bs->handle, &bs->write_buf[bs->write_pos],
+                  sizeof(bs->write_buf) - bs->write_pos -
+                  bs->write_avail);
+    if (n < 0) {
+        if (bs->handle != (void*) (long) bs->fd) {
+            int err = SSL_get_error(bs->handle, n);
+            bs->error = !(err == SSL_ERROR_WANT_READ
+                         || err == SSL_ERROR_WANT_WRITE);
+            bs->error |= n == 0;
+        } else {
+            bs->error = !(errno == EAGAIN || errno == EWOULDBLOCK);
+            bs->error |= n == 0;
+        }
+        return -1;
+    }
+    bs->write_pos += n;
+    if (bs->write_pos == sizeof(bs->write_buf)) {
+        bs->write_pos = 0;
+        bs->write_avail = sizeof(bs->write_buf);
+    }
+    return 0;
+}
+
+int bs_write(BufStream *bs, const void *data, int cnt)
+{
+    const char *buf = data;
+    int pos = 0;
+
+    while (pos < cnt) {
+        int avail = cnt - pos;
+        if (avail > bs->write_avail) {
+            avail = bs->write_avail;
+        }
+        if (avail == 0) {
+            if (bs_flush(bs) < 0) return bs->error ? -1 : pos;
+        }
+        memcpy(&bs->write_buf[sizeof(bs->write_buf) - bs->write_avail], &buf[pos], avail);
+        pos += avail;
+        bs->write_avail -= avail;
+    }
+
+    return pos;
+}
+
 typedef enum {
     HTTP_METH_GET
 } HTTP_Method;
@@ -268,9 +336,66 @@ int http_connection_from_sv(String_View sv)
     return -1;
 }
 
-typedef struct ServerCtx ServerCtx;
+typedef struct {
+    String_Builder sb;
+    size_t cursor;
+} HTTP_Header;
 
 typedef struct {
+    const char *content;
+    size_t content_length;
+    size_t cursor;
+} Page;
+
+const char *status_code_to_cstr(int status)
+{
+    switch (status) {
+    case 501: return "Not Implemented";
+    case 404: return "Not found";
+    }
+    fprintf(stderr, "No status code for %d\n", status);
+    assert(0 && "No status code");
+}
+
+void http_add_status(HTTP_Header *hdr, int status_code)
+{
+    char buf[256];
+
+    sb_append_cstr(&hdr->sb, "HTTP/1.1 ");
+    sprintf(buf, "%d ", status_code);
+    sb_append_cstr(&hdr->sb, buf);
+    sb_append_cstr(&hdr->sb, status_code_to_cstr(status_code));
+    sb_append_cstr(&hdr->sb, "\r\n");
+}
+
+void http_add_headerI(HTTP_Header *hdr, const char *header_name, int header_val)
+{
+    char buf[256];
+    sprintf(buf, "%d", header_val);
+    sb_append_cstr(&hdr->sb, header_name);
+    sb_append_cstr(&hdr->sb, ": ");
+    sb_append_cstr(&hdr->sb, buf);
+    sb_append_cstr(&hdr->sb, "\r\n");
+}
+
+void http_add_header(HTTP_Header *hdr, const char *header_name, const char *header_val)
+{
+    sb_append_cstr(&hdr->sb, header_name);
+    sb_append_cstr(&hdr->sb, ": ");
+    sb_append_cstr(&hdr->sb, header_val);
+    sb_append_cstr(&hdr->sb, "\r\n");
+}
+
+void http_end_header(HTTP_Header *hdr)
+{
+    sb_append_cstr(&hdr->sb, "\r\n");
+}
+
+typedef struct ServerCtx ServerCtx;
+typedef struct Connection Connection;
+typedef int (AnswerFunc)(Connection *);
+
+struct Connection {
     ServerCtx *ctx;
     BufStream stream;
     bool dropped;
@@ -282,13 +407,22 @@ typedef struct {
     } state;
     struct pollfd *pfd;
 
+/* Request data: */
     String_Builder request;
     String_Builder requested_path;
-    String_View method;
-    String_View connection;
+    String_View query;
+    String_View method_sv;
+    String_View connection_sv;
+    HTTP_Method method;
+    HTTP_Connection connection;
 
-    int afd;
-} Connection;
+/* Response data: */
+    HTTP_Header header;
+    Page page;
+    AnswerFunc *answer;
+    DIR *dir;
+    FILE *file;
+};
 
 typedef struct {
     Connection *items;
@@ -339,12 +473,17 @@ int from_hexchars(String_View chars, int *v)
     return 0;
 }
 
-String_Builder http_decode_path(String_View path, int *err)
+String_Builder http_decode_path(String_View path, String_View *query, int *err)
 {
     String_Builder sb = {0};
 
     while (path.count) {
         int b = 0;
+        if (*path.data == '?') {
+            sv_chop(&path, 1);
+            *query = path;
+            return sb;
+        }
         if (*path.data != '%') {
             da_append(&sb, *sv_chop(&path, 1).data);
             continue;
@@ -357,6 +496,8 @@ String_Builder http_decode_path(String_View path, int *err)
         }
         da_append(&sb, b);
     }
+
+    da_append(&sb, 0);
 
     return sb;
 
@@ -376,11 +517,11 @@ int parse_http_first_line(Connection *c, String_View line)
         String_View word = sv_chop_by_delim(&line, ' ');
         line = sv_trim_left(line);
         switch (i) {
-            case 0: c->method = word; break;
-            case 1:
-                assert(!c->requested_path.items);
-                c->requested_path = http_decode_path(word, &err);
-                break;
+        case 0: c->method_sv = word; break;
+        case 1:
+            assert(!c->requested_path.count);
+            c->requested_path = http_decode_path(word, &c->query, &err);
+            break;
         }
         if (err) return -1;
     }
@@ -403,7 +544,7 @@ int parse_http_line(Connection *c, String_View line, int ln)
     /* TODO: make a place for headers which needs to 
        be saved to make this place a simple loop */
     if (sv_eq_cstr(header, "Connection")) {
-        c->connection = value;
+        c->connection_sv = value;
     }
     return 0;
 }
@@ -422,6 +563,177 @@ int parse_http_request(Connection *c)
     return 0;
 }
 
+void clean_connection(Connection *c)
+{
+    c->query.count = 0;
+    c->request.count = 0;
+    c->requested_path.count = 0;
+    c->header.sb.count = 0;
+    c->header.cursor = 0;
+}
+
+void delete_connection(Connection *c)
+{
+    close(c->stream.fd);
+    da_delete(&c->ctx->connections, c);
+    da_delete(&c->ctx->polls, c->pfd);
+    free(c->request.items);
+    free(c->requested_path.items);
+    free(c->header.sb.items);
+    if (c->secure) {
+        SSL_free(c->stream.handle);
+    }
+}
+
+int client_send_page(Connection *c)
+{
+    for (;;) {
+        int n = bs_write(
+            &c->stream,
+            &c->page.content[c->page.cursor],
+            c->page.content_length - c->page.cursor); 
+        if (n < 0) return -1;
+        if (n == 0) return 0;
+        c->page.cursor += n;
+    }
+    assert(0 && "unreachable");
+}
+
+int client_send_header(Connection *c)
+{
+    for (;;) {
+        int n = bs_write(
+            &c->stream,
+            &c->header.sb.items[c->header.cursor],
+            c->header.sb.count - c->header.cursor); 
+        if (n < 0) return -1;
+        if (n == 0) return 0;
+        c->header.cursor += n;
+    }
+    assert(0 && "unreachable");
+}
+
+int is_slash(int c)
+{
+    return c == '/';
+}
+
+int client_send_404(Connection *c)
+{
+    if (c->header.sb.count == 0) {
+        c->page.content = "<html><head><title>404 File not found</title>"
+            "</head><body><h1>404 File not found</h1><hr></body></html>";
+
+        c->page.content_length = strlen(c->page.content);
+        http_add_status(&c->header, 404);
+        http_add_header(&c->header, "Content-Type", "text/html");
+        http_add_headerI(&c->header, "Content-Length", c->page.content_length);
+        http_add_header(&c->header, "Connection", "keep-alive");
+        http_end_header(&c->header);
+    }
+    if (client_send_header(c) < 0) return -1;
+
+    return client_send_page(c);
+}
+
+int client_send_403(Connection *c)
+{
+    if (c->header.sb.count == 0) {
+        c->page.content = "<html><head><title>403 Permission denied</title>"
+            "</head><body><h1>403 Permission denied</h1><hr></body></html>";
+
+        c->page.content_length = strlen(c->page.content);
+        http_add_status(&c->header, 403);
+        http_add_header(&c->header, "Content-Type", "text/html");
+        http_add_headerI(&c->header, "Content-Length", c->page.content_length);
+        http_add_header(&c->header, "Connection", "keep-alive");
+        http_end_header(&c->header);
+    }
+    if (client_send_header(c) < 0) return -1;
+
+    return client_send_page(c);
+}
+
+int client_send_500(Connection *c)
+{
+    if (c->header.sb.count == 0) {
+        c->page.content = "<html><head><title>500 Internal server error</title>"
+            "</head><body><h1>500 Internal server error</h1><hr></body></html>";
+
+        c->page.content_length = strlen(c->page.content);
+        http_add_status(&c->header, 500);
+        http_add_header(&c->header, "Content-Type", "text/html");
+        http_add_headerI(&c->header, "Content-Length", c->page.content_length);
+        http_add_header(&c->header, "Connection", "keep-alive");
+        http_end_header(&c->header);
+    }
+    if (client_send_header(c) < 0) return -1;
+
+    return client_send_page(c);
+}
+
+int client_send_501(Connection *c)
+{
+    if (c->header.sb.count == 0) {
+        c->page.content = "<html><head><title>501 Not Implemented</title>"
+            "</head><body><h1>501 Not Implemented</h1><hr></body></html>";
+
+        c->page.content_length = strlen(c->page.content);
+        http_add_status(&c->header, 501);
+        http_add_header(&c->header, "Content-Type", "text/html");
+        http_add_headerI(&c->header, "Content-Length", c->page.content_length);
+        http_add_header(&c->header, "Connection", "keep-alive");
+        http_end_header(&c->header);
+    }
+    if (client_send_header(c) < 0) return -1;
+
+    return client_send_page(c);
+}
+
+int client_send_dir(Connection *c)
+{
+    return client_send_501(c);
+}
+
+int client_send_file(Connection *c)
+{
+    return client_send_501(c);
+}
+
+void client_handle_get(Connection *c)
+{
+    /* TODO: add path checking to prevent paths like /../../proc/self/... */
+
+    struct stat st;
+    const char *path;
+    String_View path_sv = sv_from_sb(&c->requested_path);
+    path_sv.count--; /* NULL terminator */
+    sv_chop_while(&path_sv, is_slash);
+
+    if (path_sv.count == 0) {
+        path = ".";
+    } else {
+        path = path_sv.data;
+    }
+    if (stat(path, &st) < 0) {
+        switch (errno) {
+        case EACCES: c->answer = client_send_403; return;
+        case ENOENT: c->answer = client_send_404; return;
+        default: c->answer = client_send_500; return;
+        }
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        c->answer = client_send_dir;
+        return;
+    }
+    if (S_ISREG(st.st_mode)) {
+        c->answer = client_send_file;
+        return;
+    }
+    c->answer = client_send_500;
+}
+
 int client_request(Connection *c)
 {
     switch (read_until(&c->stream, &c->request, "\r\n\r\n")) {
@@ -436,9 +748,12 @@ int client_request(Connection *c)
         return -1;
     }
 
-    printf(SV_Fmt"\n", SV_Arg(c->method));
-    printf(SV_Fmt"\n", SV_Arg(sv_from_sb(&c->requested_path)));
-    printf(SV_Fmt"\n", SV_Arg(c->connection));
+    switch (http_method_from_sv(c->method_sv)) {
+    case HTTP_METH_GET: {
+        client_handle_get(c);
+    } break;
+    default: c->answer = client_send_501;
+    }
 
     c->pfd->events = POLLOUT;
     c->state = CST_RESPONSING;
@@ -448,28 +763,26 @@ int client_request(Connection *c)
 
 int client_response(Connection *c)
 {
-    if (c->dropped) return -1;
+    int result = c->answer(c);
 
-
-    return 0;
+    if (result == 0) {
+        bs_flush(&c->stream);
+        if (c->connection == HTTP_CONN_CLOSE) {
+            delete_connection(c);
+        } else {
+            c->state = CST_REQUEST;
+            c->pfd->events = POLLIN;
+            clean_connection(c);
+        }
+    }
+    /* TODO: drop connection when Connection: close */
+    return result;
 }
 
 void handle_output(Connection *c)
 {
-    (void) c;
-    assert(0 && "Not implemented");
-}
-
-void delete_connection(Connection *c)
-{
-    close(c->stream.fd);
-    da_delete(&c->ctx->connections, c);
-    da_delete(&c->ctx->polls, c->pfd);
-    free(c->request.items);
-    free(c->requested_path.items);
-    if (c->secure) {
-        SSL_free(c->stream.handle);
-    }
+    if (c->dropped) delete_connection(c);
+    else client_response(c);
 }
 
 void handle_input(Connection *c)
@@ -481,9 +794,7 @@ void handle_input(Connection *c)
         }
     } break;
     case CST_RESPONSING: {
-        if (client_response(c) < 0) {
-            delete_connection(c);
-        }
+        assert(0 && "responsing should not be handled at the client input");
     } break;
     default: assert(0 && "unreachable");
     }
@@ -496,6 +807,7 @@ void new_connection(ServerCtx *ctx, int fd, int secure)
     Connection c = {0};
     c.ctx = ctx;
     c.stream.fd = fd;
+    c.stream.write_avail = sizeof(c.stream.write_buf);
     if (secure) {
         SSL *ssl = SSL_new(ctx->ssl_ctx);
         SSL_set_fd(ssl, fd);
