@@ -45,8 +45,8 @@
     do { \
         ptrdiff_t i; \
         assert(sizeof(*(x)) == sizeof(*(da)->items)); \
-        i = ((x)-(da)->items)/sizeof(*(x)); \
-        assert(i >= 0); \
+        i = (x)-(da)->items; \
+        assert(i >= 0 && (size_t) i < (da)->count); \
         memcpy(&(da)->items[i], &(da)->items[i+1], sizeof(*(da)->items)*(--(da)->count - i)); \
     } while (0)
 
@@ -575,7 +575,6 @@ void clean_connection(Connection *c)
 void delete_connection(Connection *c)
 {
     close(c->stream.fd);
-    da_delete(&c->ctx->connections, c);
     da_delete(&c->ctx->polls, c->pfd);
     free(c->request.items);
     free(c->requested_path.items);
@@ -583,6 +582,7 @@ void delete_connection(Connection *c)
     if (c->secure) {
         SSL_free(c->stream.handle);
     }
+    da_delete(&c->ctx->connections, c);
 }
 
 int client_send_page(Connection *c)
@@ -775,7 +775,7 @@ int client_response(Connection *c)
             clean_connection(c);
         }
     }
-    /* TODO: drop connection when Connection: close */
+
     return result;
 }
 
@@ -843,6 +843,7 @@ void handle_server(ServerCtx *ctx)
     n = poll(ctx->polls.items, ctx->polls.count, -1);
     for (i = 0; i < ctx->polls.count && n; ++i) {
         struct pollfd *cpfd = &ctx->polls.items[i];
+        Connection *c;
         const bool secure = cpfd->fd == ctx->secure_sock;
         if (!cpfd->revents) continue;
         n--;
@@ -852,16 +853,15 @@ void handle_server(ServerCtx *ctx)
             new_connection(ctx, newsock, secure);
             continue;
         }
+        c = find_connection_by_pfd(&ctx->connections, cpfd);
+        c->pfd = cpfd;
         if (cpfd->revents & POLLIN) {
-            Connection *c = find_connection_by_pfd(&ctx->connections, cpfd);
             handle_input(c);
         }
         if (cpfd->revents & POLLOUT) {
-            Connection *c = find_connection_by_pfd(&ctx->connections, cpfd);
             handle_output(c);
         }
         if (cpfd->revents & ~(POLLOUT|POLLIN)) {
-            Connection *c = find_connection_by_pfd(&ctx->connections, cpfd);
             delete_connection(c);
         }
     }
