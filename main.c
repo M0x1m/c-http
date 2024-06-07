@@ -812,6 +812,7 @@ void new_connection(ServerCtx *ctx, int fd, int secure)
         SSL *ssl = SSL_new(ctx->ssl_ctx);
         SSL_set_fd(ssl, fd);
         if (SSL_accept(ssl) <= 0) {
+            close(fd);
             SSL_free(ssl);
             return;
         }
