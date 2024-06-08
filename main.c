@@ -110,16 +110,20 @@ String_View sv_from_cstr(const char *cstr)
     return sv_from_parts(cstr, strlen(cstr));
 }
 
-int sv_ends_with_cstr(String_View sv, const char *cstr)
-{
-    const size_t cstr_len = strlen(cstr);
-    return cstr_len > sv.count ||
-            !sv_eq_cstr(sv_from_parts(&sv.data[sv.count-cstr_len], cstr_len), cstr);
-}
-
 String_View sv_from_sb(const String_Builder *sb)
 {
     return sv_from_parts(sb->items, sb->count);
+}
+
+String_View sv_rchop(String_View *sv, size_t n)
+{
+    String_View chopped;
+    if (n > sv->count) n = sv->count;
+    chopped.data = &sv->data[sv->count - n];
+    chopped.count = n;
+    sv->count -= n;
+
+    return chopped;
 }
 
 String_View sv_chop(String_View *sv, size_t n)
@@ -204,6 +208,18 @@ String_View sv_chop_by_cstr_delim(String_View *sv, const char *cstr)
     return sv_chop_by_sv_delim(sv, sv_from_cstr(cstr));
 }
 
+int sv_ends_with_cstr(String_View sv, const char *cstr)
+{
+    const size_t cstr_len = strlen(cstr);
+
+    return sv_eq_cstr(sv_rchop(&sv, cstr_len), cstr);
+}
+
+void sb_append_sv(String_Builder *sb, String_View sv)
+{
+    da_append_many(sb, sv.data, sv.count);
+}
+
 typedef struct {
     int fd;
     void *handle;
@@ -271,7 +287,7 @@ int bs_read(BufStream *bs, void *to, int cnt)
 }
 
 int read_until(BufStream *bs, String_Builder *sb, const char *until) {
-    while (sv_ends_with_cstr(sv_from_sb(sb), until)) {
+    while (!sv_ends_with_cstr(sv_from_sb(sb), until)) {
         char b;
         int result;
         result = bs_read(bs, &b, sizeof(b));
@@ -357,17 +373,15 @@ int http_connection_from_sv(String_View sv)
 typedef struct {
     String_Builder sb;
     size_t cursor;
-} HTTP_Header;
+} Content;
 
-typedef struct {
-    const char *content;
-    size_t content_length;
-    size_t cursor;
-} Page;
+typedef Content HTTP_Header, Page;
 
 const char *status_code_to_cstr(int status)
 {
     switch (status) {
+    case 200: return "OK";
+    case 301: return "Moved permanently";
     case 501: return "Not Implemented";
     case 404: return "Not found";
     }
@@ -411,7 +425,7 @@ void http_end_header(HTTP_Header *hdr)
 
 typedef struct ServerCtx ServerCtx;
 typedef struct Connection Connection;
-typedef int (AnswerFunc)(Connection *);
+typedef int (*AnswerFunc)(Connection *);
 
 struct Connection {
     ServerCtx *ctx;
@@ -438,7 +452,8 @@ struct Connection {
 /* Response data: */
     HTTP_Header header;
     Page page;
-    AnswerFunc *answer;
+    AnswerFunc answer;
+    const char *path;
     DIR *dir;
     FILE *file;
 };
@@ -559,7 +574,7 @@ int parse_http_line(Connection *c, String_View line, int ln)
     value = sv_trim(line);
     if (value.count == 0) return -1;
 
-    /* TODO: make a place for headers which needs to 
+    /* TODO: make a place for headers which needs to
        be saved to make this place a simple loop */
     if (sv_eq_cstr(header, "Connection")) {
         c->connection_sv = value;
@@ -595,45 +610,39 @@ void delete_connection(Connection *c)
     free(c->request.items);
     free(c->requested_path.items);
     free(c->header.sb.items);
+    free(c->page.sb.items);
     if (c->secure) {
         SSL_free(c->stream.handle);
     }
     da_delete(&c->ctx->connections, c);
 }
 
-int client_send_page(Connection *c)
+int client_send_content(Connection *c, Content *z)
 {
     for (;;) {
         int n = bs_write(
             &c->stream,
-            &c->page.content[c->page.cursor],
-            c->page.content_length - c->page.cursor); 
+            &z->sb.items[z->cursor],
+            z->sb.count - z->cursor);
         if (n < 0) return -1;
         if (n == 0) {
-            c->page.cursor = 0;
+            z->sb.count = 0;
+            z->cursor = 0;
             return 0;
         }
-        c->page.cursor += n;
+        z->cursor += n;
     }
     assert(0 && "unreachable");
 }
 
 int client_send_header(Connection *c)
 {
-    for (;;) {
-        int n = bs_write(
-            &c->stream,
-            &c->header.sb.items[c->header.cursor],
-            c->header.sb.count - c->header.cursor); 
-        if (n < 0) return -1;
-        if (n == 0) {
-            c->header.sb.count = 0;
-            c->header.cursor = 0;
-            return 0;
-        }
-        c->header.cursor += n;
-    }
-    assert(0 && "unreachable");
+    return client_send_content(c, &c->header);
+}
+
+int client_send_page(Connection *c)
+{
+    return client_send_content(c, &c->page);
 }
 
 int is_slash(int c)
@@ -641,18 +650,27 @@ int is_slash(int c)
     return c == '/';
 }
 
+void http_mk_page_header
+    (HTTP_Header *hdr,
+     int status,
+     const char *mimetype,
+     ssize_t content_length)
+{
+    http_add_status(hdr, status);
+    http_add_header(hdr, "Content-Type", mimetype);
+    if (content_length >= 0) http_add_headerI(hdr, "Content-Length", content_length);
+    http_add_header(hdr, "Connection", "keep-alive");
+    http_end_header(hdr);
+}
+
 int client_send_404(Connection *c)
 {
     if (c->header.sb.count == 0) {
-        c->page.content = "<html><head><title>404 File not found</title>"
+        const char *content = "<html><head><title>404 File not found</title>"
             "</head><body><h1>404 File not found</h1><hr></body></html>";
 
-        c->page.content_length = strlen(c->page.content);
-        http_add_status(&c->header, 404);
-        http_add_header(&c->header, "Content-Type", "text/html");
-        http_add_headerI(&c->header, "Content-Length", c->page.content_length);
-        http_add_header(&c->header, "Connection", "keep-alive");
-        http_end_header(&c->header);
+        sb_append_cstr(&c->page.sb, content);
+        http_mk_page_header(&c->header, 404, "text/html", c->page.sb.count);
     }
     if (client_send_header(c) < 0) return -1;
 
@@ -662,15 +680,11 @@ int client_send_404(Connection *c)
 int client_send_403(Connection *c)
 {
     if (c->header.sb.count == 0) {
-        c->page.content = "<html><head><title>403 Permission denied</title>"
+        const char *content = "<html><head><title>403 Permission denied</title>"
             "</head><body><h1>403 Permission denied</h1><hr></body></html>";
 
-        c->page.content_length = strlen(c->page.content);
-        http_add_status(&c->header, 403);
-        http_add_header(&c->header, "Content-Type", "text/html");
-        http_add_headerI(&c->header, "Content-Length", c->page.content_length);
-        http_add_header(&c->header, "Connection", "keep-alive");
-        http_end_header(&c->header);
+        sb_append_cstr(&c->page.sb, content);
+        http_mk_page_header(&c->header, 403, "text/html", c->page.sb.count);
     }
     if (client_send_header(c) < 0) return -1;
 
@@ -680,15 +694,11 @@ int client_send_403(Connection *c)
 int client_send_500(Connection *c)
 {
     if (c->header.sb.count == 0) {
-        c->page.content = "<html><head><title>500 Internal server error</title>"
+        const char *content = "<html><head><title>500 Internal server error</title>"
             "</head><body><h1>500 Internal server error</h1><hr></body></html>";
 
-        c->page.content_length = strlen(c->page.content);
-        http_add_status(&c->header, 500);
-        http_add_header(&c->header, "Content-Type", "text/html");
-        http_add_headerI(&c->header, "Content-Length", c->page.content_length);
-        http_add_header(&c->header, "Connection", "keep-alive");
-        http_end_header(&c->header);
+        sb_append_cstr(&c->page.sb, content);
+        http_mk_page_header(&c->header, 500, "text/html", c->page.sb.count);
     }
     if (client_send_header(c) < 0) return -1;
 
@@ -698,15 +708,50 @@ int client_send_500(Connection *c)
 int client_send_501(Connection *c)
 {
     if (c->header.sb.count == 0) {
-        c->page.content = "<html><head><title>501 Not Implemented</title>"
+        const char *content = "<html><head><title>501 Not Implemented</title>"
             "</head><body><h1>501 Not Implemented</h1><hr></body></html>";
 
-        c->page.content_length = strlen(c->page.content);
-        http_add_status(&c->header, 501);
-        http_add_header(&c->header, "Content-Type", "text/html");
-        http_add_headerI(&c->header, "Content-Length", c->page.content_length);
-        http_add_header(&c->header, "Connection", "keep-alive");
-        http_end_header(&c->header);
+        sb_append_cstr(&c->page.sb, content);
+        http_mk_page_header(&c->header, 501, "text/html", c->page.sb.count);
+    }
+    if (client_send_header(c) < 0) return -1;
+
+    return client_send_page(c);
+}
+
+void generate_page_dirlist(String_View path, DIR *d, Page *p)
+{
+    struct dirent *dt;
+    sb_append_cstr(&p->sb, "<html><head><title>"
+            "Index of ");
+    sb_append_sv(&p->sb, path);
+    sb_append_cstr(&p->sb, "</title><head><body>"
+            "<h1>Index of ");
+    sb_append_sv(&p->sb, path);
+    sb_append_cstr(&p->sb, "</h1><hr><pre>");
+
+    while ((dt = readdir(d))) {
+        struct stat st;
+        if (strcmp(dt->d_name, ".") == 0) continue;
+
+        fstatat(dirfd(d), dt->d_name, &st, 0);
+        sb_append_cstr(&p->sb, "<a href=\"./");
+        sb_append_cstr(&p->sb, dt->d_name);
+        if (S_ISDIR(st.st_mode))
+            sb_append_cstr(&p->sb, "/");
+        sb_append_cstr(&p->sb, "\">");
+        sb_append_cstr(&p->sb, dt->d_name);
+        if (S_ISDIR(st.st_mode))
+            sb_append_cstr(&p->sb, "/");
+        sb_append_cstr(&p->sb, "</a>\n");
+    }
+    sb_append_cstr(&p->sb, "</pre></body></html>");
+}
+
+int client_send_200(Connection *c, const char *mimetype)
+{
+    if (c->header.sb.count == 0) {
+        http_mk_page_header(&c->header, 200, mimetype, c->page.sb.count);
     }
     if (client_send_header(c) < 0) return -1;
 
@@ -715,7 +760,36 @@ int client_send_501(Connection *c)
 
 int client_send_dir(Connection *c)
 {
-    return client_send_501(c);
+    String_View path = sv_from_sb(&c->requested_path);
+    path.count--; /* NULL terminator */
+
+    if (!sv_ends_with_cstr(path, "/")) {
+        if (!c->header.sb.count) {
+            http_add_status(&c->header, 301);
+            sb_append_cstr(&c->header.sb, "Location: ");
+            sb_append_sv(&c->header.sb, path);
+            sb_append_cstr(&c->header.sb, "/\r\n");
+            http_add_header(&c->header, "Connection", "keep-alive");
+            http_end_header(&c->header);
+        }
+        return client_send_header(c);
+    }
+
+    if (!c->dir) {
+        c->dir = opendir(c->path);
+        if (!c->dir) {
+            c->answer = client_send_500;
+            return -1;
+        }
+    }
+
+    if (!c->page.sb.count) {
+        generate_page_dirlist(path, c->dir, &c->page);
+        closedir(c->dir);
+        c->dir = NULL;
+    }
+
+    return client_send_200(c, "text/html");
 }
 
 int client_send_file(Connection *c)
@@ -745,6 +819,7 @@ void client_handle_get(Connection *c)
         default: c->answer = client_send_500; return;
         }
     }
+    c->path = path;
 
     if (S_ISDIR(st.st_mode)) {
         c->answer = client_send_dir;
