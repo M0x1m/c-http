@@ -403,7 +403,8 @@ struct Connection {
     time_t last_packet;
     enum {
         CST_REQUEST,
-        CST_RESPONSING
+        CST_RESPONSING,
+        CST_ACCEPTING
     } state;
     struct pollfd *pfd;
 
@@ -784,9 +785,31 @@ void handle_output(Connection *c)
     else client_response(c);
 }
 
+void try_accept(Connection *c)
+{
+    int result;
+    assert(c->secure && "try_accept should happen only in https");
+    result = SSL_accept(c->stream.handle);
+    if (result == 1) {
+        c->state = CST_REQUEST;
+        c->pfd->events = POLLIN;
+        return;
+    } else if (result < 0) {
+        int err = SSL_get_error(c->stream.handle, result);
+        switch (err) {
+        case SSL_ERROR_WANT_READ: c->pfd->events = POLLIN; return;
+        case SSL_ERROR_WANT_WRITE: c->pfd->events = POLLOUT; return;
+        }
+    }
+    delete_connection(c);
+}
+
 void handle_input(Connection *c)
 {
     switch (c->state) {
+    case CST_ACCEPTING: {
+        try_accept(c);
+    } break;
     case CST_REQUEST: {
         if (client_request(c) < 0) {
             delete_connection(c);
@@ -806,15 +829,13 @@ void new_connection(ServerCtx *ctx, int fd, int secure)
     Connection c = {0};
     c.ctx = ctx;
     c.stream.fd = fd;
+    ioctl(fd, FIONBIO, &opt);
     c.stream.write_avail = sizeof(c.stream.write_buf);
+    c.state = CST_REQUEST;
     if (secure) {
         SSL *ssl = SSL_new(ctx->ssl_ctx);
         SSL_set_fd(ssl, fd);
-        if (SSL_accept(ssl) <= 0) {
-            close(fd);
-            SSL_free(ssl);
-            return;
-        }
+        c.state = CST_ACCEPTING;
 
         c.secure = true;
         c.stream.handle = ssl;
@@ -826,7 +847,6 @@ void new_connection(ServerCtx *ctx, int fd, int secure)
         c.stream.write = (int (*)(void *, const void *, int)) (intptr_t) write;
     }
     c.last_packet = time(NULL);
-    ioctl(fd, FIONBIO, &opt);
     pfd.fd = fd;
     pfd.events = POLLIN;
     pfd.revents = 0;
