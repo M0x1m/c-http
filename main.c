@@ -819,6 +819,7 @@ void try_accept(Connection *c)
         case SSL_ERROR_WANT_WRITE: c->pfd->events = POLLOUT; return;
         }
     }
+    /* TODO: in case if it is http connection send 301 to https */
     delete_connection(c);
 }
 
