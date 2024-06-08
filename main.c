@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,8 +16,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <execinfo.h>
+#include <signal.h>
 
 #include <openssl/ssl.h>
+
+#define ARRAY_LEN(xs) (sizeof(xs)/sizeof(*(xs)))
 
 #define da_alloc(da, cnt) \
     do { \
@@ -49,6 +54,19 @@
         assert(i >= 0 && (size_t) i < (da)->count); \
         memcpy(&(da)->items[i], &(da)->items[i+1], sizeof(*(da)->items)*(--(da)->count - i)); \
     } while (0)
+
+void signal_handler(int sig)
+{
+    int size;
+    void *symbs[100];
+
+    fprintf(stderr, "ERROR: caught signal SIG%s\n", sigabbrev_np(sig));
+    fprintf(stderr, "Backtrace:\n");
+
+    size = backtrace(symbs, ARRAY_LEN(symbs));
+    backtrace_symbols_fd(symbs, size, STDERR_FILENO);
+    signal(sig, SIG_DFL);
+}
 
 typedef struct {
     char *items;
@@ -962,6 +980,9 @@ int main(int argc, char **argv)
     ctx.sock = create_binded_sock(&ctx, port);
     ctx.secure_sock = create_binded_sock(&ctx, secure_port);
 
+    signal(SIGPIPE, signal_handler);
+    signal(SIGSEGV, signal_handler);
+    signal(SIGABRT, signal_handler);
     while (true) {
         handle_server(&ctx);
     }
