@@ -586,8 +586,6 @@ void clean_connection(Connection *c)
     c->query.count = 0;
     c->request.count = 0;
     c->requested_path.count = 0;
-    c->header.sb.count = 0;
-    c->header.cursor = 0;
 }
 
 void delete_connection(Connection *c)
@@ -611,7 +609,10 @@ int client_send_page(Connection *c)
             &c->page.content[c->page.cursor],
             c->page.content_length - c->page.cursor); 
         if (n < 0) return -1;
-        if (n == 0) return 0;
+        if (n == 0) {
+            c->page.cursor = 0;
+            return 0;
+        }
         c->page.cursor += n;
     }
     assert(0 && "unreachable");
@@ -625,7 +626,11 @@ int client_send_header(Connection *c)
             &c->header.sb.items[c->header.cursor],
             c->header.sb.count - c->header.cursor); 
         if (n < 0) return -1;
-        if (n == 0) return 0;
+        if (n == 0) {
+            c->header.sb.count = 0;
+            c->header.cursor = 0;
+            return 0;
+        }
         c->header.cursor += n;
     }
     assert(0 && "unreachable");
